@@ -16,6 +16,10 @@ DOCUMENT_EXTENSIONS = {".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt", ".odt"
 
 MAX_TEXT_LENGTH = 4000
 MAX_IMAGE_DIMENSION = 1024
+MAX_VIDEO_THUMBNAIL_SIZE = 512
+MAX_PDF_PAGES = 10
+MAX_EXCEL_SHEETS = 3
+MAX_EXCEL_ROWS = 20
 
 
 class FileProcessor:
@@ -98,7 +102,7 @@ class FileProcessor:
 
             parts = []
             with pdfplumber.open(filepath) as pdf:
-                for i, page in enumerate(pdf.pages[:10]):
+                for i, page in enumerate(pdf.pages[:MAX_PDF_PAGES]):
                     text = page.extract_text()
                     if text:
                         parts.append(f"[Page {i + 1}]\n{text}")
@@ -124,7 +128,7 @@ class FileProcessor:
             if ret:
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 img = PILImage.fromarray(frame_rgb)
-                img.thumbnail((512, 512))
+                img.thumbnail((MAX_VIDEO_THUMBNAIL_SIZE, MAX_VIDEO_THUMBNAIL_SIZE))
                 buf = io.BytesIO()
                 img.save(buf, format="JPEG")
                 encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
@@ -193,9 +197,9 @@ class FileProcessor:
 
                 wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
                 parts = []
-                for sheet in list(wb.worksheets)[:3]:
+                for sheet in list(wb.worksheets)[:MAX_EXCEL_SHEETS]:
                     rows = []
-                    for row in sheet.iter_rows(max_row=20, values_only=True):
+                    for row in sheet.iter_rows(max_row=MAX_EXCEL_ROWS, values_only=True):
                         row_str = ", ".join(str(c) for c in row if c is not None)
                         if row_str:
                             rows.append(row_str)

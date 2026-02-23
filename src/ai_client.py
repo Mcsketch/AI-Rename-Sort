@@ -5,6 +5,9 @@ import re
 import requests
 
 
+MAX_CONTENT_PREVIEW = 3000
+
+
 class LMStudioClient:
     """Client for the LMStudio local inference server."""
 
@@ -87,7 +90,7 @@ class LMStudioClient:
                 },
             ]
         else:
-            content_preview = str(file_content)[:3000] if file_content else "(empty)"
+            content_preview = str(file_content)[:MAX_CONTENT_PREVIEW] if file_content else "(empty)"
             user_prompt = (
                 f"Original filename: {filename}\n"
                 f"File type: {file_type}\n\n"

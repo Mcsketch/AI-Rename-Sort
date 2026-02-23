@@ -14,6 +14,12 @@ from .config_manager import ConfigManager
 from .file_processor import FileProcessor
 from .watcher import FileWatcher
 
+# Timing constants (milliseconds)
+CONNECTION_CHECK_DELAY_MS = 600
+MODEL_SAVE_INTERVAL_MS = 2000
+STATUS_MESSAGE_DURATION_MS = 2500
+AUTO_APPLY_DELAY_MS = 200
+
 
 class AIRenameSortApp:
     """Tkinter GUI application that watches a folder and uses AI to rename/sort files."""
@@ -41,9 +47,9 @@ class AIRenameSortApp:
         threading.Thread(target=self._process_loop, daemon=True).start()
 
         # Check LMStudio connection shortly after startup
-        self.root.after(600, self._check_connection)
+        self.root.after(CONNECTION_CHECK_DELAY_MS, self._check_connection)
         # Periodic model-save check
-        self.root.after(2000, self._periodic_save_model)
+        self.root.after(MODEL_SAVE_INTERVAL_MS, self._periodic_save_model)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -466,7 +472,7 @@ class AIRenameSortApp:
         self.config.set("lmstudio_url", url)
         self.ai_client.base_url = url.rstrip("/")
         self.settings_status_var.set("✓ URL saved")
-        self.root.after(2500, lambda: self.settings_status_var.set(""))
+        self.root.after(STATUS_MESSAGE_DURATION_MS, lambda: self.settings_status_var.set(""))
         self._check_connection()
 
     def _refresh_models(self):
@@ -512,7 +518,7 @@ class AIRenameSortApp:
         current = self.model_var.get()
         if current and current != self.config.get("model"):
             self.config.set("model", current)
-        self.root.after(2000, self._periodic_save_model)
+        self.root.after(MODEL_SAVE_INTERVAL_MS, self._periodic_save_model)
 
     # ------------------------------------------------------------------
     # Folder management
@@ -675,7 +681,7 @@ class AIRenameSortApp:
                 if iid:
                     self._apply_item(p, iid)
 
-            self.root.after(200, _auto_apply)
+            self.root.after(AUTO_APPLY_DELAY_MS, _auto_apply)
 
     # ------------------------------------------------------------------
     # Window close
