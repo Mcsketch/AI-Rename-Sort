@@ -4,6 +4,7 @@ import queue
 import re
 import shutil
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
@@ -11,7 +12,10 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from .ai_client import LMStudioClient
 from .config_manager import ConfigManager
+from .duplicate_detector import DuplicateDetector
+from .duplicate_dialog import DuplicateDialog
 from .file_processor import FileProcessor
+from .filter_dialog import ALL_KNOWN_EXTS, WatchFilterDialog
 from .watcher import FileWatcher
 
 # Timing constants (milliseconds)
@@ -34,17 +38,29 @@ class AIRenameSortApp:
         self.config = ConfigManager()
         self.ai_client = LMStudioClient(self.config.get("lmstudio_url", "http://localhost:1234"))
         self.file_processor = FileProcessor()
+        self.duplicate_detector = DuplicateDetector()
         self.watcher: FileWatcher | None = None
+
+        # Stop event – set while watching is paused/stopped, cleared on start
+        self._stop_event = threading.Event()
+        self._stop_event.set()  # initially stopped
+
+        # Active watch filter (set when Start is clicked; None = no filter)
+        self._watch_filter: dict | None = None
 
         # Processing queue (filepaths to analyse)
         self._proc_queue: queue.Queue[str] = queue.Queue()
         # Maps filepath -> treeview item id
         self._queue_items: dict[str, str] = {}
+        # Tracks last rescan time per filepath
+        self._rescanned: dict[str, float] = {}
 
         self._build_ui()
 
         # Background processing thread
         threading.Thread(target=self._process_loop, daemon=True).start()
+        # Background periodic rescan thread
+        threading.Thread(target=self._rescan_loop, daemon=True).start()
 
         # Check LMStudio connection shortly after startup
         self.root.after(CONNECTION_CHECK_DELAY_MS, self._check_connection)
@@ -67,16 +83,23 @@ class AIRenameSortApp:
         self.auto_apply_var = tk.BooleanVar(value=self.config.get("auto_apply", False))
         self.auto_process_var = tk.BooleanVar(value=self.config.get("auto_process", False))
         self.url_var = tk.StringVar(value=self.config.get("lmstudio_url", "http://localhost:1234"))
-        self.model_var = tk.StringVar(value=self.config.get("model", ""))
+        self.vision_model_var = tk.StringVar(value=self.config.get("vision_model", ""))
+        self.text_model_var = tk.StringVar(value=self.config.get("text_model", ""))
         self.new_folder_var = tk.StringVar()
         self.settings_status_var = tk.StringVar()
+        self.rescan_interval_var = tk.IntVar(
+            value=self.config.get("rescan_interval_secs", 60)
+        )
+        self.rescan_idle_var = tk.IntVar(
+            value=self.config.get("rescan_idle_mins", 5)
+        )
 
         main = ttk.Frame(self.root, padding=8)
         main.pack(fill=tk.BOTH, expand=True)
 
         self._build_top_section(main)
 
-        nb = ttk.Notebook(main)
+        self._nb = nb = ttk.Notebook(main)
         nb.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
 
         for title, builder in [
@@ -88,6 +111,11 @@ class AIRenameSortApp:
             frame = ttk.Frame(nb)
             nb.add(frame, text=f"  {title}  ")
             builder(frame)
+
+        # --- Debug Tab ---
+        debug_frame = ttk.Frame(nb)
+        nb.add(debug_frame, text="  🔍 Debug  ")
+        self._build_debug_tab(debug_frame)
 
     def _build_top_section(self, parent):
         top = ttk.LabelFrame(parent, text="File Watcher", padding=8)
@@ -151,6 +179,7 @@ class AIRenameSortApp:
         self.queue_tree.tag_configure("done", foreground="green")
         self.queue_tree.tag_configure("error", foreground="red")
         self.queue_tree.tag_configure("processing", foreground="gray")
+        self.queue_tree.tag_configure("rescan", foreground="#0077CC")
 
         vsb = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.queue_tree.yview)
         self.queue_tree.configure(yscrollcommand=vsb.set)
@@ -176,30 +205,76 @@ class AIRenameSortApp:
         ttk.Entry(f, textvariable=self.url_var, width=42).grid(row=0, column=1, sticky="ew", padx=(6, 6), pady=6)
         ttk.Button(f, text="Save & Connect", command=self._save_url).grid(row=0, column=2, pady=6)
 
-        # Model selection
-        ttk.Label(f, text="AI Model:").grid(row=1, column=0, sticky="w", pady=6)
-        self.model_combo = ttk.Combobox(f, textvariable=self.model_var, width=40)
-        self.model_combo.grid(row=1, column=1, sticky="ew", padx=(6, 6), pady=6)
+        # Vision model selection
+        ttk.Label(f, text="Vision Model:").grid(row=1, column=0, sticky="w", pady=6)
+        self.vision_model_combo = ttk.Combobox(f, textvariable=self.vision_model_var, width=40)
+        self.vision_model_combo.grid(row=1, column=1, sticky="ew", padx=(6, 6), pady=6)
         ttk.Button(f, text="Refresh", command=self._refresh_models).grid(row=1, column=2, pady=6)
+        ttk.Label(f, text="Used for images and video frames.", foreground="gray"
+                  ).grid(row=2, column=1, sticky="w", padx=(6, 0))
+
+        # Text model selection
+        ttk.Label(f, text="Text Model:").grid(row=3, column=0, sticky="w", pady=6)
+        self.text_model_combo = ttk.Combobox(f, textvariable=self.text_model_var, width=40)
+        self.text_model_combo.grid(row=3, column=1, sticky="ew", padx=(6, 6), pady=6)
+        ttk.Label(f, text="Used for PDFs, documents, text/code, and unknown files.", foreground="gray"
+                  ).grid(row=4, column=1, sticky="w", padx=(6, 0))
 
         # Auto-process
-        ttk.Label(f, text="Auto-process new files:").grid(row=2, column=0, sticky="w", pady=6)
+        ttk.Label(f, text="Auto-process new files:").grid(row=5, column=0, sticky="w", pady=6)
         ttk.Checkbutton(f, variable=self.auto_process_var,
                         command=lambda: self.config.set("auto_process", self.auto_process_var.get())
-                        ).grid(row=2, column=1, sticky="w", padx=(6, 0), pady=6)
+                        ).grid(row=5, column=1, sticky="w", padx=(6, 0), pady=6)
         ttk.Label(f, text="Send files to AI automatically when detected.", foreground="gray"
-                  ).grid(row=3, column=1, sticky="w", padx=(6, 0))
+                  ).grid(row=6, column=1, sticky="w", padx=(6, 0))
 
         # Auto-apply
-        ttk.Label(f, text="Auto-apply suggestions:").grid(row=4, column=0, sticky="w", pady=6)
+        ttk.Label(f, text="Auto-apply suggestions:").grid(row=7, column=0, sticky="w", pady=6)
         ttk.Checkbutton(f, variable=self.auto_apply_var,
                         command=lambda: self.config.set("auto_apply", self.auto_apply_var.get())
-                        ).grid(row=4, column=1, sticky="w", padx=(6, 0), pady=6)
+                        ).grid(row=7, column=1, sticky="w", padx=(6, 0), pady=6)
         ttk.Label(f, text="Rename and move files automatically after AI analysis.", foreground="gray"
-                  ).grid(row=5, column=1, sticky="w", padx=(6, 0))
+                  ).grid(row=8, column=1, sticky="w", padx=(6, 0))
+
+        # ---- Periodic rescan settings --------------------------------
+        ttk.Separator(f, orient=tk.HORIZONTAL).grid(
+            row=9, column=0, columnspan=3, sticky="ew", pady=(10, 4)
+        )
+        ttk.Label(f, text="Periodic Rescan", font=("TkDefaultFont", 9, "bold")
+                  ).grid(row=10, column=0, columnspan=3, sticky="w", pady=(0, 4))
+
+        ttk.Label(f, text="Interval between files (sec):").grid(row=11, column=0, sticky="w", pady=6)
+        interval_spin = ttk.Spinbox(
+            f, from_=10, to=3600, increment=10,
+            textvariable=self.rescan_interval_var, width=8,
+            command=self._save_rescan_settings,
+        )
+        interval_spin.grid(row=11, column=1, sticky="w", padx=(6, 6), pady=6)
+        interval_spin.bind("<FocusOut>", self._save_rescan_settings)
+        interval_spin.bind("<Return>", self._save_rescan_settings)
+        ttk.Label(
+            f,
+            text="Seconds to wait between enqueueing each file during a rescan pass.",
+            foreground="gray",
+        ).grid(row=12, column=1, sticky="w", padx=(6, 0))
+
+        ttk.Label(f, text="Idle between passes (min):").grid(row=13, column=0, sticky="w", pady=6)
+        idle_spin = ttk.Spinbox(
+            f, from_=1, to=720, increment=1,
+            textvariable=self.rescan_idle_var, width=8,
+            command=self._save_rescan_settings,
+        )
+        idle_spin.grid(row=13, column=1, sticky="w", padx=(6, 6), pady=6)
+        idle_spin.bind("<FocusOut>", self._save_rescan_settings)
+        idle_spin.bind("<Return>", self._save_rescan_settings)
+        ttk.Label(
+            f,
+            text="Minutes to wait after completing a full rescan pass before starting the next.",
+            foreground="gray",
+        ).grid(row=14, column=1, sticky="w", padx=(6, 0))
 
         ttk.Label(f, textvariable=self.settings_status_var, foreground="green"
-                  ).grid(row=6, column=0, columnspan=3, sticky="w", pady=10)
+                  ).grid(row=15, column=0, columnspan=3, sticky="w", pady=10)
         f.columnconfigure(1, weight=1)
 
     # ---- Folders tab -------------------------------------------------
@@ -247,6 +322,109 @@ class AIRenameSortApp:
             foreground="gray",
         ).pack(anchor="w", pady=(6, 0))
 
+    # ---- Debug tab ---------------------------------------------------
+
+    def _build_debug_tab(self, parent):
+        top = ttk.Frame(parent)
+        top.pack(fill=tk.X, padx=6, pady=6)
+        ttk.Label(top, text="AI Payload Inspector", font=("TkDefaultFont", 9, "bold")).pack(side=tk.LEFT)
+        ttk.Button(top, text="Clear", command=self._clear_debug).pack(side=tk.RIGHT)
+        ttk.Label(
+            top,
+            text="  Shows the exact content sent to and received from the AI for each file.",
+            foreground="gray",
+        ).pack(side=tk.LEFT, padx=(8, 0))
+
+        paned = ttk.PanedWindow(parent, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+
+        # Left: payload (what was sent)
+        left_lf = ttk.LabelFrame(paned, text="Sent to AI", padding=4)
+        paned.add(left_lf, weight=3)
+        self._debug_sent = scrolledtext.ScrolledText(
+            left_lf, font=("Consolas", 8), wrap=tk.WORD, state=tk.DISABLED,
+            bg="#1e1e1e", fg="#9cdcfe", insertbackground="white",
+        )
+        self._debug_sent.pack(fill=tk.BOTH, expand=True)
+
+        # Right: raw response + parsed result
+        right_lf = ttk.LabelFrame(paned, text="AI Response", padding=4)
+        paned.add(right_lf, weight=2)
+        self._debug_resp = scrolledtext.ScrolledText(
+            right_lf, font=("Consolas", 8), wrap=tk.WORD, state=tk.DISABLED,
+            bg="#1e1e1e", fg="#ce9178", insertbackground="white",
+        )
+        self._debug_resp.pack(fill=tk.BOTH, expand=True)
+
+    def _clear_debug(self):
+        for widget in (self._debug_sent, self._debug_resp):
+            widget.config(state=tk.NORMAL)
+            widget.delete("1.0", tk.END)
+            widget.config(state=tk.DISABLED)
+
+    def _log_debug_payload(
+        self,
+        filepath: str,
+        content: str,
+        file_type: str,
+        messages: list,
+        raw_response: str,
+        suggestion: dict,
+    ):
+        """Write AI payload and response to the Debug tab (main thread only)."""
+        sep = "=" * 60 + "\n"
+
+        # ---- Sent panel ----------------------------------------------
+        # Reconstruct the text portions of the message list for display
+        sent_lines = [sep, f"FILE:      {filepath}\n", f"TYPE:      {file_type}\n",
+                      f"CONTENT:   {len(content) if not content.startswith('data:') else '(binary/base64)'} chars\n"]
+
+        if not content.startswith("data:"):
+            preview_len = min(len(content), 2000)
+            sent_lines.append(f"\nCONTENT PREVIEW ({preview_len} of {len(content)} chars):\n")
+            sent_lines.append(content[:preview_len])
+            if len(content) > preview_len:
+                sent_lines.append(f"\n… [{len(content) - preview_len} chars truncated]")
+        else:
+            sent_lines.append("\nCONTENT: <base64 image/video — not shown>")
+
+        sent_lines.append("\n\nPROMPT MESSAGES:\n")
+        for msg in messages:
+            role = msg.get("role", "?").upper()
+            body = msg.get("content", "")
+            if isinstance(body, list):
+                # Multimodal — show text parts only
+                text_parts = [p.get("text", "") for p in body if p.get("type") == "text"]
+                body = "\n".join(text_parts) + "\n<image_url omitted>"
+            sent_lines.append(f"[{role}]\n{body}\n\n")
+
+        sent_text = "".join(sent_lines)
+
+        # ---- Response panel ------------------------------------------
+        resp_lines = [
+            sep,
+            f"FILE:  {os.path.basename(filepath)}\n\n",
+            "RAW RESPONSE:\n",
+            raw_response or "(empty)",
+            "\n\nPARSED RESULT:\n",
+            f"  filename : {suggestion.get('filename', '?')}\n",
+            f"  folder   : {suggestion.get('folder', '?')}\n",
+            f"  reason   : {suggestion.get('reason', '?')}\n",
+        ]
+        resp_text = "".join(resp_lines)
+
+        def _write():
+            for widget, text in (
+                (self._debug_sent, sent_text),
+                (self._debug_resp, resp_text),
+            ):
+                widget.config(state=tk.NORMAL)
+                widget.insert(tk.END, text)
+                widget.see(tk.END)
+                widget.config(state=tk.DISABLED)
+
+        self.root.after(0, _write)
+
     # ---- Log tab -----------------------------------------------------
 
     def _build_log_tab(self, parent):
@@ -283,9 +461,20 @@ class AIRenameSortApp:
         if not os.path.isdir(watch):
             messagebox.showerror("Error", f"Folder does not exist:\n{watch}")
             return
-        if not self.config.get("model"):
-            messagebox.showwarning("No Model", "Please select an AI model in the Settings tab first.")
+        if not self.config.get("vision_model") and not self.config.get("text_model"):
+            messagebox.showwarning("No Model", "Please select at least one AI model in the Settings tab first.")
             return
+
+        # Show the file-type / subfolder filter dialog
+        dlg = WatchFilterDialog(self.root, watch, self.config.get("watch_filter"))
+        self.root.wait_window(dlg)
+        if dlg.result is None:
+            return  # user cancelled
+
+        self._watch_filter = dlg.result
+        self.config.set("watch_filter", dlg.result_config)
+
+        self._stop_event.clear()  # allow _process_loop and _rescan_loop to run
 
         self.watcher = FileWatcher(watch, self._on_new_file)
         self.watcher.start()
@@ -295,8 +484,10 @@ class AIRenameSortApp:
         self.status_var.set("Watching")
         self.status_label.config(foreground="green")
         self._log(f"Started watching: {watch}")
+        self._log(self._filter_summary())
 
     def _stop_watching(self):
+        self._stop_event.set()  # halt _process_loop after current file finishes
         if self.watcher:
             self.watcher.stop()
             self.watcher = None
@@ -308,12 +499,83 @@ class AIRenameSortApp:
 
     def _on_new_file(self, filepath):
         """Called from the watcher thread when a new file appears."""
+        if not self._passes_watch_filter(filepath):
+            return
         self._log_thread(f"Detected: {filepath}")
         if self.auto_process_var.get():
             self._proc_queue.put(filepath)
             self.root.after(0, lambda p=filepath: self._upsert_queue(p, "", "", "Queued"))
         else:
             self.root.after(0, lambda p=filepath: self._upsert_queue(p, "", "", "Pending"))
+
+    def _passes_watch_filter(self, filepath: str) -> bool:
+        """Return True if *filepath* matches the active watch filter."""
+        wf = self._watch_filter
+        if not wf:
+            return True
+
+        fpath = Path(filepath)
+        ext = fpath.suffix.lower()
+
+        # ---- Extension / type filter ---------------------------------
+        allowed_exts: frozenset | None = wf.get("allowed_exts")
+        include_other: bool = wf.get("include_other", True)
+
+        if allowed_exts is not None:
+            # "__other__" sentinel means we accept unknown extensions too
+            if "__other__" in allowed_exts:
+                passes_ext = (ext in allowed_exts) or (ext not in ALL_KNOWN_EXTS)
+            else:
+                passes_ext = ext in allowed_exts
+            if not passes_ext:
+                return False
+
+        # ---- Subfolder filter ----------------------------------------
+        watch = self.config.get("watch_folder", "")
+        root_only: bool = wf.get("root_only", False)
+        allowed_subdirs: frozenset | None = wf.get("allowed_subdirs")
+
+        if root_only or allowed_subdirs is not None:
+            try:
+                rel = fpath.relative_to(watch)
+            except ValueError:
+                return True  # can't determine — allow
+
+            depth = len(rel.parts)
+
+            if root_only:
+                return depth == 1  # must be directly in watch folder
+
+            # specific-subfolder mode
+            if depth == 1:
+                # File is in root — include if root ("") is in the set
+                return "" in allowed_subdirs  # type: ignore[operator]
+            # File is in a subfolder
+            return rel.parts[0] in allowed_subdirs  # type: ignore[operator]
+
+        return True
+
+    def _filter_summary(self) -> str:
+        """Return a human-readable description of the active watch filter."""
+        wf = self._watch_filter
+        if not wf:
+            return "Filter: all file types, all subfolders."
+
+        cfg = self.config.get("watch_filter") or {}
+        cats = cfg.get("allowed_categories", [])
+        mode = cfg.get("subfolder_mode", "all")
+        subdirs = cfg.get("allowed_subdirs", [])
+
+        type_part = ", ".join(cats) if cats else "no types"
+        if mode == "root_only":
+            dir_part = "root folder only"
+        elif mode == "all":
+            dir_part = "all subfolders"
+        else:
+            listed = ", ".join(subdirs) if subdirs else "(none)"
+            dir_part = f"subfolders: {listed}"
+
+        return f"Filter active — types: {type_part}  |  {dir_part}."
 
     # ------------------------------------------------------------------
     # Queue helpers
@@ -481,19 +743,38 @@ class AIRenameSortApp:
         def fetch():
             try:
                 models = self.ai_client.get_models()
-                self.root.after(0, lambda: self._update_models(models))
+                assignments = LMStudioClient.auto_assign_models(models)
+                self.root.after(0, lambda: self._update_models(models, assignments))
             except Exception as exc:
                 self.root.after(0, lambda e=exc: self._log(f"Error fetching models: {e}"))
 
         threading.Thread(target=fetch, daemon=True).start()
 
-    def _update_models(self, models):
-        self.model_combo["values"] = models
+    def _update_models(self, models, assignments: dict[str, str] | None = None):
+        self.vision_model_combo["values"] = models
+        self.text_model_combo["values"] = models
+
         if models:
-            if not self.model_var.get() or self.model_var.get() not in models:
-                self.model_var.set(models[0])
-                self.config.set("model", models[0])
-            self._log(f"Found {len(models)} model(s): {', '.join(models)}")
+            # Auto-assign if combos are empty or current selection is stale
+            if assignments:
+                if not self.vision_model_var.get() or self.vision_model_var.get() not in models:
+                    suggested = assignments.get("vision_model", "")
+                    self.vision_model_var.set(suggested or models[0])
+                if not self.text_model_var.get() or self.text_model_var.get() not in models:
+                    suggested = assignments.get("text_model", "")
+                    self.text_model_var.set(suggested or models[0])
+
+            # Persist
+            self.config.set("vision_model", self.vision_model_var.get())
+            self.config.set("text_model", self.text_model_var.get())
+
+            vision_type = LMStudioClient.classify_model(self.vision_model_var.get()) if self.vision_model_var.get() else "?"
+            text_type = LMStudioClient.classify_model(self.text_model_var.get()) if self.text_model_var.get() else "?"
+            self._log(
+                f"Found {len(models)} model(s). "
+                f"Vision → {self.vision_model_var.get() or '(none)'} [{vision_type}], "
+                f"Text → {self.text_model_var.get() or '(none)'} [{text_type}]"
+            )
         else:
             self._log("No models found. Is LMStudio running with a loaded model?")
 
@@ -508,16 +789,19 @@ class AIRenameSortApp:
         if connected:
             self.conn_var.set("Connected ✓")
             self.conn_label.config(foreground="green")
-            if not self.model_combo.get():
+            if not self.vision_model_combo.get() and not self.text_model_combo.get():
                 self._refresh_models()
         else:
             self.conn_var.set("Not Connected")
             self.conn_label.config(foreground="red")
 
     def _periodic_save_model(self):
-        current = self.model_var.get()
-        if current and current != self.config.get("model"):
-            self.config.set("model", current)
+        v = self.vision_model_var.get()
+        t = self.text_model_var.get()
+        if v and v != self.config.get("vision_model"):
+            self.config.set("vision_model", v)
+        if t and t != self.config.get("text_model"):
+            self.config.set("text_model", t)
         self.root.after(MODEL_SAVE_INTERVAL_MS, self._periodic_save_model)
 
     # ------------------------------------------------------------------
@@ -622,6 +906,13 @@ class AIRenameSortApp:
                 filepath = self._proc_queue.get(timeout=1)
             except _queue.Empty:
                 continue
+            # If stopped, put the item back and wait until resumed
+            if self._stop_event.is_set():
+                self._proc_queue.put(filepath)
+                self._proc_queue.task_done()
+                while self._stop_event.is_set():
+                    time.sleep(0.5)
+                continue
             try:
                 self._process_file(filepath)
             except Exception as exc:
@@ -639,12 +930,7 @@ class AIRenameSortApp:
             self.root.after(0, lambda p=filepath: self._upsert_queue(p, "", "", "Error"))
             return
 
-        model = self.config.get("model", "")
-        if not model:
-            self._log_thread("No AI model selected. Configure one in Settings.")
-            self.root.after(0, lambda p=filepath: self._upsert_queue(p, "", "", "No model"))
-            return
-
+        # --- Extract content & determine file type --------------------
         try:
             content, file_type = self.file_processor.extract_content(filepath)
             self._log_thread(f"Extracted content ({file_type}) from {name}")
@@ -653,6 +939,54 @@ class AIRenameSortApp:
             self.root.after(0, lambda p=filepath: self._upsert_queue(p, "", "", "Error"))
             return
 
+        # Bail early if Stop was clicked during content extraction
+        if self._stop_event.is_set():
+            self._log_thread(f"Stopped before processing: {name}")
+            self.root.after(0, lambda p=filepath: self._upsert_queue(p, "", "", "Pending"))
+            return
+
+        # --- Select the right model for this file type ----------------
+        model = self.config.get_model_for_type(file_type)
+        if not model:
+            self._log_thread("No AI model selected. Configure one in Settings.")
+            self.root.after(0, lambda p=filepath: self._upsert_queue(p, "", "", "No model"))
+            return
+
+        self._log_thread(f"Using model '{model}' for {file_type} file")
+
+        # --- Duplicate detection --------------------------------------
+        search_dirs = []
+        watch = self.config.get("watch_folder", "")
+        output = self.config.get("output_folder", "")
+        if watch:
+            search_dirs.append(watch)
+        if output and output != watch:
+            search_dirs.append(output)
+
+        if search_dirs:
+            try:
+                candidates = self.duplicate_detector.find_candidates(filepath, search_dirs)
+            except Exception as exc:
+                self._log_thread(f"Duplicate check error: {exc}")
+                candidates = []
+
+            if candidates:
+                dup_result = self._handle_duplicates(filepath, content, file_type, name, model, candidates)
+                if dup_result == "skip":
+                    self._log_thread(f"Skipped (duplicate): {name}")
+                    self.root.after(0, lambda p=filepath: self._upsert_queue(p, "", "", "Skipped"))
+                    return
+                elif dup_result == "replace":
+                    pass
+                # "keep_both" or None → continue normally
+
+        # Bail again if Stop was clicked during duplicate detection
+        if self._stop_event.is_set():
+            self._log_thread(f"Stopped before AI call: {name}")
+            self.root.after(0, lambda p=filepath: self._upsert_queue(p, "", "", "Pending"))
+            return
+
+        # --- AI analysis ----------------------------------------------
         try:
             folders = self.config.get_folders()
             suggestion = self.ai_client.analyze_file(model, content, file_type, name, folders)
@@ -661,13 +995,25 @@ class AIRenameSortApp:
             self.root.after(0, lambda p=filepath: self._upsert_queue(p, "", "", "Error"))
             return
 
+        # Bail if Stop was clicked while the AI call was in-flight
+        if self._stop_event.is_set():
+            self._log_thread(f"Stopped after AI returned (result discarded): {name}")
+            self.root.after(0, lambda p=filepath: self._upsert_queue(p, "", "", "Pending"))
+            return
+
         suggested_name = suggestion.get("filename", "unnamed_file")
         folder = suggestion.get("folder", "Other")
         reason = suggestion.get("reason", "")
         self._log_thread(f"Suggestion: '{suggested_name}' → {folder}  ({reason})")
 
-        # Offer to add unknown folder
-        if folder not in self.config.get_folders():
+        # Log to debug tab — capture before next file overwrites them
+        _dbg_messages = list(self.ai_client._last_messages)
+        _dbg_raw = self.ai_client._last_raw_response
+        _dbg_content = content if not isinstance(content, bytes) else "<binary>"
+        self._log_debug_payload(filepath, _dbg_content, file_type, _dbg_messages, _dbg_raw, suggestion)
+
+        # Offer to add unknown folder (only when actively watching)
+        if folder not in self.config.get_folders() and not self._stop_event.is_set():
             self.root.after(0, lambda fo=folder: self._suggest_new_folder(fo))
 
         self.root.after(
@@ -675,19 +1021,188 @@ class AIRenameSortApp:
             lambda p=filepath, n=suggested_name, fo=folder: self._upsert_queue(p, n, fo, "Ready"),
         )
 
-        if self.auto_apply_var.get():
+        if self.auto_apply_var.get() and not self._stop_event.is_set():
             def _auto_apply(p=filepath):
-                iid = self._queue_items.get(p)
-                if iid:
-                    self._apply_item(p, iid)
+                if not self._stop_event.is_set():
+                    iid = self._queue_items.get(p)
+                    if iid:
+                        self._apply_item(p, iid)
 
             self.root.after(AUTO_APPLY_DELAY_MS, _auto_apply)
+
+    # ------------------------------------------------------------------
+    # Duplicate handling
+    # ------------------------------------------------------------------
+
+    def _handle_duplicates(
+        self,
+        filepath: str,
+        content,
+        file_type: str,
+        filename: str,
+        model: str,
+        candidates: list[tuple[str, str]],
+    ) -> str | None:
+        """Process duplicate candidates and show a dialog if needed.
+
+        Returns the user's chosen action: ``"keep_both"``, ``"replace"``,
+        ``"skip"``, or ``None`` (dialog dismissed).
+        """
+        import threading as _threading
+
+        for candidate_path, match_type in candidates:
+            ai_confidence: float | None = None
+            ai_reason = ""
+
+            if match_type == "exact":
+                # No AI needed – it's an identical file
+                ai_confidence = 1.0
+                ai_reason = "Files are byte-for-byte identical."
+            else:
+                # Ask AI to confirm near-duplicate
+                try:
+                    cand_content, cand_type = self.file_processor.extract_content(candidate_path)
+                    cand_name = os.path.basename(candidate_path)
+                    result = self.ai_client.compare_for_duplicate(
+                        model, content, file_type, filename,
+                        cand_content, cand_type, cand_name,
+                    )
+                    if not result.get("is_duplicate", False) or result.get("confidence", 0) < 0.7:
+                        continue  # AI says it's not a real duplicate
+                    ai_confidence = result.get("confidence", 0.0)
+                    ai_reason = result.get("reason", "")
+                except Exception as exc:
+                    self._log_thread(f"AI duplicate comparison failed: {exc}")
+                    continue
+
+            self._log_thread(
+                f"Duplicate candidate: {os.path.basename(candidate_path)} "
+                f"({match_type}, confidence={ai_confidence})"
+            )
+
+            # Show the side-by-side dialog on the main thread and wait
+            result_holder: list[str | None] = [None]
+            event = _threading.Event()
+
+            def _show_dialog(
+                _fp=filepath, _cp=candidate_path, _mt=match_type,
+                _conf=ai_confidence, _reason=ai_reason,
+            ):
+                dlg = DuplicateDialog(
+                    self.root, _fp, _cp,
+                    match_type=_mt,
+                    ai_confidence=_conf,
+                    ai_reason=_reason,
+                )
+                self.root.wait_window(dlg)
+                result_holder[0] = dlg.result
+                event.set()
+
+            self.root.after(0, _show_dialog)
+            event.wait()  # block background thread until dialog closes
+
+            action = result_holder[0]
+            if action == "replace":
+                try:
+                    os.remove(candidate_path)
+                    self._log_thread(f"Deleted existing: {candidate_path}")
+                except OSError as exc:
+                    self._log_thread(f"Could not delete existing file: {exc}")
+                return "replace"
+            elif action == "skip":
+                return "skip"
+            else:
+                return "keep_both"
+
+        return None  # no confirmed duplicates
+
+    # ------------------------------------------------------------------
+    # Periodic rescan
+    # ------------------------------------------------------------------
+
+    def _save_rescan_settings(self, *_):
+        """Persist rescan interval/idle settings from the Settings spin boxes."""
+        try:
+            interval = int(self.rescan_interval_var.get())
+            idle = int(self.rescan_idle_var.get())
+        except (ValueError, tk.TclError):
+            return
+        self.config.set("rescan_interval_secs", max(10, interval))
+        self.config.set("rescan_idle_mins", max(1, idle))
+
+    def _on_rescan_file(self, filepath: str):
+        """Schedule a file for re-evaluation during a periodic rescan pass."""
+        if not os.path.exists(filepath):
+            return
+        self._log(f"Rescan queued: {os.path.basename(filepath)}")
+        self._proc_queue.put(filepath)
+        self._upsert_queue(filepath, "", "", "Rescan")
+
+    def _rescan_loop(self):
+        """Background thread: periodically re-evaluate all files for AI accuracy."""
+        # Let the app fully start up before first scan
+        time.sleep(10)
+
+        while True:
+            # Wait if watching is stopped
+            if self._stop_event.is_set():
+                time.sleep(10)
+                continue
+
+            watch = self.config.get("watch_folder", "")
+            output = self.config.get("output_folder", "")
+
+            if not watch:
+                time.sleep(30)
+                continue
+
+            interval_secs = max(10, self.config.get("rescan_interval_secs", 60))
+            idle_mins = max(1, self.config.get("rescan_idle_mins", 5))
+            now = time.time()
+
+            # Build list of directories to scan
+            scan_dirs: list[str] = []
+            if os.path.isdir(watch):
+                scan_dirs.append(watch)
+            if output and output != watch and os.path.isdir(output):
+                scan_dirs.append(output)
+
+            files_found = 0
+            for scan_dir in scan_dirs:
+                for root_dir, _dirs, filenames in os.walk(scan_dir):
+                    for fname in filenames:
+                        if self._stop_event.is_set():
+                            break
+                        fpath = os.path.join(root_dir, fname)
+                        # Respect the watch filter during periodic rescans
+                        if not self._passes_watch_filter(fpath):
+                            continue
+                        last_scan = self._rescanned.get(fpath, 0.0)
+                        if now - last_scan >= interval_secs:
+                            self._rescanned[fpath] = now
+                            self.root.after(0, lambda p=fpath: self._on_rescan_file(p))
+                            files_found += 1
+                            # Throttle: wait between each file to stay slow/accurate
+                            time.sleep(interval_secs)
+                            now = time.time()
+                    if self._stop_event.is_set():
+                        break
+                if self._stop_event.is_set():
+                    break
+
+            if not self._stop_event.is_set():
+                self._log_thread(
+                    f"Rescan pass complete — {files_found} file(s) queued. "
+                    f"Next pass in {idle_mins} min."
+                )
+                time.sleep(idle_mins * 60)
 
     # ------------------------------------------------------------------
     # Window close
     # ------------------------------------------------------------------
 
     def on_close(self):
+        self._stop_event.set()
         if self.watcher:
             self.watcher.stop()
         self.root.destroy()

@@ -81,7 +81,7 @@ class FileWatcher:
     def start(self):
         self._handler = _NewFileHandler(self.callback)
         self._observer = Observer()
-        self._observer.schedule(self._handler, self.watch_folder, recursive=False)
+        self._observer.schedule(self._handler, self.watch_folder, recursive=True)
         self._observer.start()
 
     def stop(self):

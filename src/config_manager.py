@@ -7,18 +7,45 @@ DEFAULT_CONFIG = {
     "output_folder": "",
     "lmstudio_url": "http://localhost:1234",
     "model": "",
+    "vision_model": "",
+    "text_model": "",
     "folders": [
-        "Documents/Work",
-        "Documents/Personal",
-        "Documents/Finance",
-        "Photos/Events",
-        "Photos/Travel",
-        "Videos",
-        "Downloads/Software",
-        "Other",
+        # Documents
+        "Documents/Finances",
+        "Documents/Legal",
+        "Documents/Invoices",
+        "Documents/Receipts",
+        "Documents/Taxes",
+        "Documents/Medical",
+        "Documents/Housing",
+        "Documents/Employment",
+        "Documents/Hobbies",
+        "Documents/Manuals",
+        "Documents/Education",
+        "Documents/Identification",
+        "Documents/Correspondence",
+        "Documents/Subscriptions",
+        "Documents/Archives",
+        # Pictures
+        "Pictures/Family",
+        "Pictures/Friends",
+        "Pictures/Pets",
+        "Pictures/Travel",
+        "Pictures/Holidays",
+        "Pictures/Home Improvement",
+        "Pictures/3D Printing",
+        "Pictures/Laser Engraving",
+        "Pictures/Screenshots",
+        "Pictures/Documents",
+        "Pictures/Nature",
+        "Pictures/Events",
+        "Pictures/Archives",
     ],
     "auto_process": False,
     "auto_apply": False,
+    "rescan_interval_secs": 60,
+    "rescan_idle_mins": 5,
+    "watch_filter": None,
 }
 
 
@@ -73,3 +100,18 @@ class ConfigManager:
 
     def update_folders(self, folders):
         self.set("folders", list(folders))
+
+    def get_model_for_type(self, file_type: str) -> str:
+        """Return the best model for the given file type.
+
+        Uses the vision model for image/video types and the text model for
+        everything else.  Falls back to the other slot or the legacy ``model``
+        key if one slot is empty.
+        """
+        vision_model = self.get("vision_model", "")
+        text_model = self.get("text_model", "")
+        legacy_model = self.get("model", "")
+
+        if file_type in ("image", "video"):
+            return vision_model or text_model or legacy_model
+        return text_model or vision_model or legacy_model
