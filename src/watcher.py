@@ -1,7 +1,7 @@
 """Folder watcher that detects newly created/moved files."""
-import os
 import threading
 import time
+from pathlib import Path
 
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
@@ -32,7 +32,7 @@ class _NewFileHandler(FileSystemEventHandler):
 
     def _track(self, filepath):
         try:
-            size = os.path.getsize(filepath)
+            size = Path(filepath).stat().st_size
         except OSError:
             size = 0
         with self._lock:
@@ -49,7 +49,7 @@ class _NewFileHandler(FileSystemEventHandler):
                     if now - last_time < self.SETTLE_SECONDS:
                         continue
                     try:
-                        current_size = os.path.getsize(filepath)
+                        current_size = Path(filepath).stat().st_size
                     except OSError:
                         del self._pending[filepath]
                         continue

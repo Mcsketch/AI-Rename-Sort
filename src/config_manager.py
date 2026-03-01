@@ -46,6 +46,17 @@ DEFAULT_CONFIG = {
     "rescan_interval_secs": 60,
     "rescan_idle_mins": 5,
     "watch_filter": None,
+    "max_context_length": 8000,
+    # Renaming options
+    "rename_files": True,
+    "suggest_similar_title": False,
+    "naming_style": "snake_case",           # "snake_case" | "kebab-case" | "CamelCase" | "Spaces Allowed"
+    "prepend_date": "None",                 # "None" | "File Creation Date"
+    "standardize_extensions": True,
+    # Folder options
+    "folder_mode": "Strict",                # "Strict" | "Flexible"
+    # File operations
+    "conflict_resolution": "Auto-increment",  # "Auto-increment" | "Overwrite" | "Skip"
 }
 
 

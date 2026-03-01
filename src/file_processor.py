@@ -40,22 +40,25 @@ class FileProcessor:
             return "document"
         return "unknown"
 
-    def extract_content(self, filepath):
+    def extract_content(self, filepath, max_length=None):
         """Return (content, file_type) for the given file.
 
         ``content`` is either a base64 data URL (for images) or a plain string.
+        ``max_length`` limits how many characters of text content are returned;
+        defaults to ``MAX_TEXT_LENGTH`` when not specified.
         """
+        _max = max_length if max_length is not None else MAX_TEXT_LENGTH
         file_type = self.get_file_type(filepath)
         if file_type == "image":
             return self._extract_image(filepath)
         if file_type == "pdf":
-            return self._extract_pdf(filepath)
+            return self._extract_pdf(filepath, _max)
         if file_type == "video":
             return self._extract_video(filepath)
         if file_type == "text":
-            return self._extract_text(filepath)
+            return self._extract_text(filepath, _max)
         if file_type == "document":
-            return self._extract_document(filepath)
+            return self._extract_document(filepath, _max)
         # Unknown: return basic file info
         size = os.path.getsize(filepath)
         return f"Unknown file: {Path(filepath).name}\nSize: {size / 1024:.1f} KB", "unknown"
@@ -95,7 +98,7 @@ class FileProcessor:
         except Exception as exc:
             return f"Image file (could not read: {exc})", "image"
 
-    def _extract_pdf(self, filepath):
+    def _extract_pdf(self, filepath, max_length=MAX_TEXT_LENGTH):
         """Extract text from a PDF using pdfplumber."""
         try:
             import pdfplumber
@@ -107,7 +110,7 @@ class FileProcessor:
                     if text:
                         parts.append(f"[Page {i + 1}]\n{text}")
             content = "\n\n".join(parts)
-            return (content[:MAX_TEXT_LENGTH] if content else "Empty PDF"), "pdf"
+            return (content[:max_length] if content else "Empty PDF"), "pdf"
         except ImportError:
             return "PDF file (pdfplumber not installed)", "pdf"
         except Exception as exc:
@@ -166,16 +169,16 @@ class FileProcessor:
             pass
         return ""
 
-    def _extract_text(self, filepath):
+    def _extract_text(self, filepath, max_length=MAX_TEXT_LENGTH):
         """Read a plain-text file."""
         try:
             with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read(MAX_TEXT_LENGTH)
+                content = f.read(max_length)
             return content, "text"
         except Exception as exc:
             return f"Text file (could not read: {exc})", "text"
 
-    def _extract_document(self, filepath):
+    def _extract_document(self, filepath, max_length=MAX_TEXT_LENGTH):
         """Extract text from Office-format documents."""
         ext = Path(filepath).suffix.lower()
 
@@ -185,7 +188,7 @@ class FileProcessor:
 
                 doc = docx.Document(filepath)
                 content = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
-                return content[:MAX_TEXT_LENGTH], "document"
+                return content[:max_length], "document"
             except ImportError:
                 pass
             except Exception as exc:
@@ -205,7 +208,7 @@ class FileProcessor:
                             rows.append(row_str)
                     if rows:
                         parts.append(f"Sheet: {sheet.title}\n" + "\n".join(rows))
-                return "\n\n".join(parts)[:MAX_TEXT_LENGTH], "document"
+                return "\n\n".join(parts)[:max_length], "document"
             except ImportError:
                 pass
             except Exception as exc:

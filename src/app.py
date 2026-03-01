@@ -1,5 +1,4 @@
 """Main GUI application for AI Rename & Sort."""
-import os
 import queue
 import re
 import shutil
@@ -92,6 +91,24 @@ class AIRenameSortApp:
         )
         self.rescan_idle_var = tk.IntVar(
             value=self.config.get("rescan_idle_mins", 5)
+        )
+        self.max_context_var = tk.IntVar(
+            value=self.config.get("max_context_length", 8000)
+        )
+
+        # --- New feature vars -----------------------------------------
+        self.rename_files_var = tk.BooleanVar(value=self.config.get("rename_files", True))
+        self.suggest_similar_title_var = tk.BooleanVar(
+            value=self.config.get("suggest_similar_title", False)
+        )
+        self.naming_style_var = tk.StringVar(value=self.config.get("naming_style", "snake_case"))
+        self.prepend_date_var = tk.StringVar(value=self.config.get("prepend_date", "None"))
+        self.standardize_ext_var = tk.BooleanVar(
+            value=self.config.get("standardize_extensions", True)
+        )
+        self.folder_mode_var = tk.StringVar(value=self.config.get("folder_mode", "Strict"))
+        self.conflict_resolution_var = tk.StringVar(
+            value=self.config.get("conflict_resolution", "Auto-increment")
         )
 
         main = ttk.Frame(self.root, padding=8)
@@ -197,85 +214,201 @@ class AIRenameSortApp:
     # ---- Settings tab ------------------------------------------------
 
     def _build_settings_tab(self, parent):
-        f = ttk.Frame(parent, padding=16)
-        f.pack(fill=tk.BOTH, expand=True)
+        # Scrollable container
+        canvas = tk.Canvas(parent, borderwidth=0, highlightthickness=0)
+        vsb = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # LMStudio URL
-        ttk.Label(f, text="LMStudio API URL:").grid(row=0, column=0, sticky="w", pady=6)
-        ttk.Entry(f, textvariable=self.url_var, width=42).grid(row=0, column=1, sticky="ew", padx=(6, 6), pady=6)
-        ttk.Button(f, text="Save & Connect", command=self._save_url).grid(row=0, column=2, pady=6)
+        inner = ttk.Frame(canvas, padding=(12, 8))
+        inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
 
-        # Vision model selection
-        ttk.Label(f, text="Vision Model:").grid(row=1, column=0, sticky="w", pady=6)
-        self.vision_model_combo = ttk.Combobox(f, textvariable=self.vision_model_var, width=40)
-        self.vision_model_combo.grid(row=1, column=1, sticky="ew", padx=(6, 6), pady=6)
-        ttk.Button(f, text="Refresh", command=self._refresh_models).grid(row=1, column=2, pady=6)
-        ttk.Label(f, text="Used for images and video frames.", foreground="gray"
-                  ).grid(row=2, column=1, sticky="w", padx=(6, 0))
+        def _on_frame_configure(_e):
+            canvas.configure(scrollregion=canvas.bbox("all"))
 
-        # Text model selection
-        ttk.Label(f, text="Text Model:").grid(row=3, column=0, sticky="w", pady=6)
-        self.text_model_combo = ttk.Combobox(f, textvariable=self.text_model_var, width=40)
-        self.text_model_combo.grid(row=3, column=1, sticky="ew", padx=(6, 6), pady=6)
-        ttk.Label(f, text="Used for PDFs, documents, text/code, and unknown files.", foreground="gray"
-                  ).grid(row=4, column=1, sticky="w", padx=(6, 0))
+        def _on_canvas_configure(e):
+            canvas.itemconfig(inner_id, width=e.width)
 
-        # Auto-process
-        ttk.Label(f, text="Auto-process new files:").grid(row=5, column=0, sticky="w", pady=6)
-        ttk.Checkbutton(f, variable=self.auto_process_var,
-                        command=lambda: self.config.set("auto_process", self.auto_process_var.get())
-                        ).grid(row=5, column=1, sticky="w", padx=(6, 0), pady=6)
-        ttk.Label(f, text="Send files to AI automatically when detected.", foreground="gray"
-                  ).grid(row=6, column=1, sticky="w", padx=(6, 0))
+        def _on_mousewheel(e):
+            canvas.yview_scroll(-1 * (e.delta // 120), "units")
 
-        # Auto-apply
-        ttk.Label(f, text="Auto-apply suggestions:").grid(row=7, column=0, sticky="w", pady=6)
-        ttk.Checkbutton(f, variable=self.auto_apply_var,
-                        command=lambda: self.config.set("auto_apply", self.auto_apply_var.get())
-                        ).grid(row=7, column=1, sticky="w", padx=(6, 0), pady=6)
-        ttk.Label(f, text="Rename and move files automatically after AI analysis.", foreground="gray"
-                  ).grid(row=8, column=1, sticky="w", padx=(6, 0))
+        inner.bind("<Configure>", _on_frame_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+        canvas.bind("<MouseWheel>", _on_mousewheel)
+        inner.bind("<MouseWheel>", _on_mousewheel)
 
-        # ---- Periodic rescan settings --------------------------------
-        ttk.Separator(f, orient=tk.HORIZONTAL).grid(
-            row=9, column=0, columnspan=3, sticky="ew", pady=(10, 4)
-        )
-        ttk.Label(f, text="Periodic Rescan", font=("TkDefaultFont", 9, "bold")
-                  ).grid(row=10, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        # ---- Connection & Models ------------------------------------
+        lf = ttk.LabelFrame(inner, text="Connection & Models", padding=10)
+        lf.pack(fill=tk.X, pady=(0, 8))
+        lf.columnconfigure(1, weight=1)
 
-        ttk.Label(f, text="Interval between files (sec):").grid(row=11, column=0, sticky="w", pady=6)
-        interval_spin = ttk.Spinbox(
-            f, from_=10, to=3600, increment=10,
-            textvariable=self.rescan_interval_var, width=8,
-            command=self._save_rescan_settings,
-        )
-        interval_spin.grid(row=11, column=1, sticky="w", padx=(6, 6), pady=6)
+        ttk.Label(lf, text="LMStudio API URL:").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Entry(lf, textvariable=self.url_var, width=42).grid(
+            row=0, column=1, sticky="ew", padx=6, pady=4)
+        ttk.Button(lf, text="Save & Connect", command=self._save_url).grid(
+            row=0, column=2, pady=4)
+
+        ttk.Label(lf, text="Vision Model:").grid(row=1, column=0, sticky="w", pady=4)
+        self.vision_model_combo = ttk.Combobox(lf, textvariable=self.vision_model_var, width=40)
+        self.vision_model_combo.grid(row=1, column=1, sticky="ew", padx=6, pady=4)
+        ttk.Button(lf, text="Refresh", command=self._refresh_models).grid(
+            row=1, column=2, pady=4)
+        ttk.Label(lf, text="Used for images and video frames.", foreground="gray").grid(
+            row=2, column=1, sticky="w", padx=6)
+
+        ttk.Label(lf, text="Text Model:").grid(row=3, column=0, sticky="w", pady=4)
+        self.text_model_combo = ttk.Combobox(lf, textvariable=self.text_model_var, width=40)
+        self.text_model_combo.grid(row=3, column=1, sticky="ew", padx=6, pady=4)
+        ttk.Label(lf, text="Used for PDFs, documents, text/code, and unknown files.",
+                  foreground="gray").grid(row=4, column=1, sticky="w", padx=6)
+
+        # ---- Processing ---------------------------------------------
+        lf2 = ttk.LabelFrame(inner, text="Processing", padding=10)
+        lf2.pack(fill=tk.X, pady=(0, 8))
+        lf2.columnconfigure(1, weight=1)
+
+        ttk.Label(lf2, text="Auto-process new files:").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Checkbutton(lf2, variable=self.auto_process_var,
+                        command=lambda: self.config.set("auto_process",
+                                                        self.auto_process_var.get())
+                        ).grid(row=0, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(lf2, text="Send files to AI automatically when detected.",
+                  foreground="gray").grid(row=1, column=1, sticky="w", padx=6)
+
+        ttk.Label(lf2, text="Auto-apply suggestions:").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Checkbutton(lf2, variable=self.auto_apply_var,
+                        command=lambda: self.config.set("auto_apply",
+                                                        self.auto_apply_var.get())
+                        ).grid(row=2, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(lf2, text="Rename and move files automatically after AI analysis.",
+                  foreground="gray").grid(row=3, column=1, sticky="w", padx=6)
+
+        ttk.Label(lf2, text="Max Context Length (chars):").grid(
+            row=4, column=0, sticky="w", pady=4)
+        ctx_spin = ttk.Spinbox(lf2, from_=500, to=128000, increment=500,
+                               textvariable=self.max_context_var, width=10,
+                               command=self._save_context_length)
+        ctx_spin.grid(row=4, column=1, sticky="w", padx=6, pady=4)
+        ctx_spin.bind("<FocusOut>", self._save_context_length)
+        ctx_spin.bind("<Return>", self._save_context_length)
+        ttk.Label(lf2,
+                  text="Characters of file content sent to the AI. Lower = faster; higher = more context.",
+                  foreground="gray").grid(row=5, column=1, sticky="w", padx=6)
+
+        # ---- Renaming Options ---------------------------------------
+        lf3 = ttk.LabelFrame(inner, text="Renaming Options", padding=10)
+        lf3.pack(fill=tk.X, pady=(0, 8))
+        lf3.columnconfigure(1, weight=1)
+
+        ttk.Label(lf3, text="Rename files:").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Checkbutton(lf3, variable=self.rename_files_var,
+                        command=lambda: self.config.set("rename_files",
+                                                        self.rename_files_var.get())
+                        ).grid(row=0, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(lf3, text="When off, only folder sorting is performed.",
+                  foreground="gray").grid(row=1, column=1, sticky="w", padx=6)
+
+        ttk.Label(lf3, text="Suggest similar title:").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Checkbutton(lf3, variable=self.suggest_similar_title_var,
+                        command=lambda: self.config.set("suggest_similar_title",
+                                                        self.suggest_similar_title_var.get())
+                        ).grid(row=2, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(lf3,
+                  text="Keep the AI filename close to the original title (clean-up only).",
+                  foreground="gray").grid(row=3, column=1, sticky="w", padx=6)
+
+        ttk.Label(lf3, text="Naming style:").grid(row=4, column=0, sticky="w", pady=4)
+        naming_combo = ttk.Combobox(lf3, textvariable=self.naming_style_var, state="readonly",
+                                    width=22,
+                                    values=["snake_case", "kebab-case", "CamelCase", "Spaces Allowed"])
+        naming_combo.grid(row=4, column=1, sticky="w", padx=6, pady=4)
+        self.naming_style_var.trace_add("write",
+            lambda *_: self.config.set("naming_style", self.naming_style_var.get()))
+        ttk.Label(lf3, text="Format applied to AI-generated filenames.",
+                  foreground="gray").grid(row=5, column=1, sticky="w", padx=6)
+
+        ttk.Label(lf3, text="Prepend date:").grid(row=6, column=0, sticky="w", pady=4)
+        date_combo = ttk.Combobox(lf3, textvariable=self.prepend_date_var, state="readonly",
+                                  width=22, values=["None", "File Creation Date"])
+        date_combo.grid(row=6, column=1, sticky="w", padx=6, pady=4)
+        self.prepend_date_var.trace_add("write",
+            lambda *_: self.config.set("prepend_date", self.prepend_date_var.get()))
+        ttk.Label(lf3, text="Optionally prefix YYYY-MM-DD_ to the final filename.",
+                  foreground="gray").grid(row=7, column=1, sticky="w", padx=6)
+
+        ttk.Label(lf3, text="Standardize extensions:").grid(row=8, column=0, sticky="w", pady=4)
+        ttk.Checkbutton(lf3, variable=self.standardize_ext_var,
+                        command=lambda: self.config.set("standardize_extensions",
+                                                        self.standardize_ext_var.get())
+                        ).grid(row=8, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(lf3,
+                  text="Map .jpeg\u2192.jpg, .htm\u2192.html, .tif\u2192.tiff, etc. and lowercase ext.",
+                  foreground="gray").grid(row=9, column=1, sticky="w", padx=6)
+
+        # ---- Folder Options -----------------------------------------
+        lf4 = ttk.LabelFrame(inner, text="Folder Options", padding=10)
+        lf4.pack(fill=tk.X, pady=(0, 8))
+        lf4.columnconfigure(1, weight=1)
+
+        ttk.Label(lf4, text="Folder mode:").grid(row=0, column=0, sticky="w", pady=4)
+        folder_combo = ttk.Combobox(lf4, textvariable=self.folder_mode_var, state="readonly",
+                                    width=22, values=["Strict", "Flexible"])
+        folder_combo.grid(row=0, column=1, sticky="w", padx=6, pady=4)
+        self.folder_mode_var.trace_add("write",
+            lambda *_: self.config.set("folder_mode", self.folder_mode_var.get()))
+        ttk.Label(lf4,
+                  text="Strict: AI picks from your list only.  Flexible: AI may suggest new subfolders.",
+                  foreground="gray").grid(row=1, column=1, sticky="w", padx=6)
+
+        # ---- File Operations ----------------------------------------
+        lf5 = ttk.LabelFrame(inner, text="File Operations", padding=10)
+        lf5.pack(fill=tk.X, pady=(0, 8))
+        lf5.columnconfigure(1, weight=1)
+
+        ttk.Label(lf5, text="Conflict resolution:").grid(row=0, column=0, sticky="w", pady=4)
+        conflict_combo = ttk.Combobox(lf5, textvariable=self.conflict_resolution_var,
+                                      state="readonly", width=22,
+                                      values=["Auto-increment", "Overwrite", "Skip"])
+        conflict_combo.grid(row=0, column=1, sticky="w", padx=6, pady=4)
+        self.conflict_resolution_var.trace_add("write",
+            lambda *_: self.config.set("conflict_resolution",
+                                       self.conflict_resolution_var.get()))
+        ttk.Label(lf5,
+                  text="What to do when a file already exists at the destination.",
+                  foreground="gray").grid(row=1, column=1, sticky="w", padx=6)
+
+        # ---- Periodic Rescan ----------------------------------------
+        lf6 = ttk.LabelFrame(inner, text="Periodic Rescan", padding=10)
+        lf6.pack(fill=tk.X, pady=(0, 8))
+        lf6.columnconfigure(1, weight=1)
+
+        ttk.Label(lf6, text="Interval between files (sec):").grid(
+            row=0, column=0, sticky="w", pady=4)
+        interval_spin = ttk.Spinbox(lf6, from_=10, to=3600, increment=10,
+                                    textvariable=self.rescan_interval_var, width=8,
+                                    command=self._save_rescan_settings)
+        interval_spin.grid(row=0, column=1, sticky="w", padx=6, pady=4)
         interval_spin.bind("<FocusOut>", self._save_rescan_settings)
         interval_spin.bind("<Return>", self._save_rescan_settings)
-        ttk.Label(
-            f,
-            text="Seconds to wait between enqueueing each file during a rescan pass.",
-            foreground="gray",
-        ).grid(row=12, column=1, sticky="w", padx=(6, 0))
+        ttk.Label(lf6,
+                  text="Seconds to wait between enqueueing each file during a rescan pass.",
+                  foreground="gray").grid(row=1, column=1, sticky="w", padx=6)
 
-        ttk.Label(f, text="Idle between passes (min):").grid(row=13, column=0, sticky="w", pady=6)
-        idle_spin = ttk.Spinbox(
-            f, from_=1, to=720, increment=1,
-            textvariable=self.rescan_idle_var, width=8,
-            command=self._save_rescan_settings,
-        )
-        idle_spin.grid(row=13, column=1, sticky="w", padx=(6, 6), pady=6)
+        ttk.Label(lf6, text="Idle between passes (min):").grid(
+            row=2, column=0, sticky="w", pady=4)
+        idle_spin = ttk.Spinbox(lf6, from_=1, to=720, increment=1,
+                                textvariable=self.rescan_idle_var, width=8,
+                                command=self._save_rescan_settings)
+        idle_spin.grid(row=2, column=1, sticky="w", padx=6, pady=4)
         idle_spin.bind("<FocusOut>", self._save_rescan_settings)
         idle_spin.bind("<Return>", self._save_rescan_settings)
-        ttk.Label(
-            f,
-            text="Minutes to wait after completing a full rescan pass before starting the next.",
-            foreground="gray",
-        ).grid(row=14, column=1, sticky="w", padx=(6, 0))
+        ttk.Label(lf6,
+                  text="Minutes to wait after completing a full rescan pass before starting the next.",
+                  foreground="gray").grid(row=3, column=1, sticky="w", padx=6)
 
-        ttk.Label(f, textvariable=self.settings_status_var, foreground="green"
-                  ).grid(row=15, column=0, columnspan=3, sticky="w", pady=10)
-        f.columnconfigure(1, weight=1)
+        ttk.Label(inner, textvariable=self.settings_status_var, foreground="green"
+                  ).pack(anchor="w", pady=(4, 0))
 
     # ---- Folders tab -------------------------------------------------
 
@@ -403,7 +536,7 @@ class AIRenameSortApp:
         # ---- Response panel ------------------------------------------
         resp_lines = [
             sep,
-            f"FILE:  {os.path.basename(filepath)}\n\n",
+            f"FILE:  {Path(filepath).name}\n\n",
             "RAW RESPONSE:\n",
             raw_response or "(empty)",
             "\n\nPARSED RESULT:\n",
@@ -458,7 +591,7 @@ class AIRenameSortApp:
         if not watch:
             messagebox.showwarning("No Folder", "Please select a Watch Folder first.")
             return
-        if not os.path.isdir(watch):
+        if not Path(watch).is_dir():
             messagebox.showerror("Error", f"Folder does not exist:\n{watch}")
             return
         if not self.config.get("vision_model") and not self.config.get("text_model"):
@@ -583,7 +716,7 @@ class AIRenameSortApp:
 
     def _upsert_queue(self, filepath, suggested, folder, status):
         """Insert or update a row in the queue treeview."""
-        filename = os.path.basename(filepath)
+        filename = Path(filepath).name
         tag = status.lower().split()[0]
 
         if filepath in self._queue_items:
@@ -693,6 +826,15 @@ class AIRenameSortApp:
         ttk.Button(btn_row, text="Save", command=save).pack(side=tk.LEFT, padx=4)
         ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(side=tk.LEFT, padx=4)
 
+    # Extension standardisation map
+    _EXT_MAP = {
+        ".jpeg": ".jpg",
+        ".jfif": ".jpg",
+        ".htm":  ".html",
+        ".tif":  ".tiff",
+        ".mpeg": ".mpg",
+    }
+
     def _apply_item(self, filepath, iid):
         values = self.queue_tree.item(iid)["values"]
         suggested_name = values[1]
@@ -704,25 +846,50 @@ class AIRenameSortApp:
 
         output_base = self.output_folder_var.get() or self.watch_folder_var.get()
         try:
-            dest_dir = os.path.join(output_base, folder) if folder else output_base
-            os.makedirs(dest_dir, exist_ok=True)
+            dest_dir = Path(output_base) / folder if folder else Path(output_base)
+            dest_dir.mkdir(parents=True, exist_ok=True)
 
-            ext = Path(filepath).suffix
-            dest_name = f"{suggested_name}{ext}"
-            dest_path = os.path.join(dest_dir, dest_name)
+            # --- Extension standardization ----------------------------
+            ext = Path(filepath).suffix.lower()
+            if self.config.get("standardize_extensions", True):
+                ext = self._EXT_MAP.get(ext, ext)
 
-            # Avoid overwriting
-            counter = 1
-            while os.path.exists(dest_path):
-                dest_path = os.path.join(dest_dir, f"{suggested_name}_{counter}{ext}")
-                counter += 1
+            # --- Date prefixing ---------------------------------------
+            final_name = suggested_name
+            if self.config.get("prepend_date", "None") == "File Creation Date":
+                try:
+                    ctime = Path(filepath).stat().st_ctime
+                    date_prefix = datetime.fromtimestamp(ctime).strftime("%Y-%m-%d_")
+                    if not final_name.startswith(date_prefix):
+                        final_name = date_prefix + final_name
+                except OSError:
+                    pass  # can't read ctime — skip prefix
+
+            dest_name = f"{final_name}{ext}"
+            dest_path = dest_dir / dest_name
+
+            # --- Conflict resolution ----------------------------------
+            strategy = self.config.get("conflict_resolution", "Auto-increment")
+
+            if dest_path.exists():
+                if strategy == "Skip":
+                    self._log(f"Skipped (exists): {dest_name}")
+                    self._upsert_queue(filepath, suggested_name, folder, "Skipped")
+                    return
+                elif strategy == "Overwrite":
+                    pass  # shutil.move will overwrite
+                else:  # Auto-increment (default)
+                    counter = 1
+                    while dest_path.exists():
+                        dest_path = dest_dir / f"{final_name}_{counter}{ext}"
+                        counter += 1
 
             shutil.move(filepath, dest_path)
-            rel = os.path.relpath(dest_path, output_base)
+            rel = dest_path.relative_to(output_base)
             self._upsert_queue(filepath, suggested_name, folder, "Done")
-            self._log(f"Moved: {os.path.basename(filepath)} → {rel}")
+            self._log(f"Moved: {Path(filepath).name} → {rel}")
         except Exception as exc:
-            self._log(f"Error applying {os.path.basename(filepath)}: {exc}")
+            self._log(f"Error applying {Path(filepath).name}: {exc}")
             messagebox.showerror("Error", f"Could not apply:\n{exc}")
 
     # ------------------------------------------------------------------
@@ -916,23 +1083,25 @@ class AIRenameSortApp:
             try:
                 self._process_file(filepath)
             except Exception as exc:
-                self._log_thread(f"Unexpected error processing {os.path.basename(filepath)}: {exc}")
+                self._log_thread(f"Unexpected error processing {Path(filepath).name}: {exc}")
             finally:
                 self._proc_queue.task_done()
 
     def _process_file(self, filepath: str):
-        name = os.path.basename(filepath)
+        name = Path(filepath).name
         self._log_thread(f"Processing: {name}")
         self.root.after(0, lambda p=filepath: self._upsert_queue(p, "", "", "Processing…"))
 
-        if not os.path.exists(filepath):
+        if not Path(filepath).exists():
             self._log_thread(f"File no longer exists: {name}")
             self.root.after(0, lambda p=filepath: self._upsert_queue(p, "", "", "Error"))
             return
 
+        max_length = self.config.get("max_context_length", 8000)
+
         # --- Extract content & determine file type --------------------
         try:
-            content, file_type = self.file_processor.extract_content(filepath)
+            content, file_type = self.file_processor.extract_content(filepath, max_length=max_length)
             self._log_thread(f"Extracted content ({file_type}) from {name}")
         except Exception as exc:
             self._log_thread(f"Content extraction failed for {name}: {exc}")
@@ -987,9 +1156,21 @@ class AIRenameSortApp:
             return
 
         # --- AI analysis ----------------------------------------------
+        rename_files = self.config.get("rename_files", True)
+        suggest_similar_title = self.config.get("suggest_similar_title", False)
+        folder_mode = self.config.get("folder_mode", "Strict")
+        naming_style = self.config.get("naming_style", "snake_case")
+
         try:
             folders = self.config.get_folders()
-            suggestion = self.ai_client.analyze_file(model, content, file_type, name, folders)
+            suggestion = self.ai_client.analyze_file(
+                model, content, file_type, name, folders,
+                max_length=max_length,
+                rename_files=rename_files,
+                suggest_similar_title=suggest_similar_title,
+                folder_mode=folder_mode,
+                naming_style=naming_style,
+            )
         except Exception as exc:
             self._log_thread(f"AI analysis failed for {name}: {exc}")
             self.root.after(0, lambda p=filepath: self._upsert_queue(p, "", "", "Error"))
@@ -1001,7 +1182,8 @@ class AIRenameSortApp:
             self.root.after(0, lambda p=filepath: self._upsert_queue(p, "", "", "Pending"))
             return
 
-        suggested_name = suggestion.get("filename", "unnamed_file")
+        # When rename_files=False the AI returns an empty filename; use the stem
+        suggested_name = suggestion.get("filename") or Path(filepath).stem
         folder = suggestion.get("folder", "Other")
         reason = suggestion.get("reason", "")
         self._log_thread(f"Suggestion: '{suggested_name}' → {folder}  ({reason})")
@@ -1062,7 +1244,7 @@ class AIRenameSortApp:
                 # Ask AI to confirm near-duplicate
                 try:
                     cand_content, cand_type = self.file_processor.extract_content(candidate_path)
-                    cand_name = os.path.basename(candidate_path)
+                    cand_name = Path(candidate_path).name
                     result = self.ai_client.compare_for_duplicate(
                         model, content, file_type, filename,
                         cand_content, cand_type, cand_name,
@@ -1076,7 +1258,7 @@ class AIRenameSortApp:
                     continue
 
             self._log_thread(
-                f"Duplicate candidate: {os.path.basename(candidate_path)} "
+                f"Duplicate candidate: {Path(candidate_path).name} "
                 f"({match_type}, confidence={ai_confidence})"
             )
 
@@ -1104,7 +1286,7 @@ class AIRenameSortApp:
             action = result_holder[0]
             if action == "replace":
                 try:
-                    os.remove(candidate_path)
+                    Path(candidate_path).unlink()
                     self._log_thread(f"Deleted existing: {candidate_path}")
                 except OSError as exc:
                     self._log_thread(f"Could not delete existing file: {exc}")
@@ -1130,11 +1312,19 @@ class AIRenameSortApp:
         self.config.set("rescan_interval_secs", max(10, interval))
         self.config.set("rescan_idle_mins", max(1, idle))
 
+    def _save_context_length(self, *_):
+        """Persist max context length from the Settings spinbox."""
+        try:
+            value = int(self.max_context_var.get())
+        except (ValueError, tk.TclError):
+            return
+        self.config.set("max_context_length", max(500, value))
+
     def _on_rescan_file(self, filepath: str):
         """Schedule a file for re-evaluation during a periodic rescan pass."""
-        if not os.path.exists(filepath):
+        if not Path(filepath).exists():
             return
-        self._log(f"Rescan queued: {os.path.basename(filepath)}")
+        self._log(f"Rescan queued: {Path(filepath).name}")
         self._proc_queue.put(filepath)
         self._upsert_queue(filepath, "", "", "Rescan")
 
@@ -1161,32 +1351,31 @@ class AIRenameSortApp:
             now = time.time()
 
             # Build list of directories to scan
-            scan_dirs: list[str] = []
-            if os.path.isdir(watch):
-                scan_dirs.append(watch)
-            if output and output != watch and os.path.isdir(output):
-                scan_dirs.append(output)
+            scan_dirs: list[Path] = []
+            if Path(watch).is_dir():
+                scan_dirs.append(Path(watch))
+            if output and output != watch and Path(output).is_dir():
+                scan_dirs.append(Path(output))
 
             files_found = 0
             for scan_dir in scan_dirs:
-                for root_dir, _dirs, filenames in os.walk(scan_dir):
-                    for fname in filenames:
-                        if self._stop_event.is_set():
-                            break
-                        fpath = os.path.join(root_dir, fname)
-                        # Respect the watch filter during periodic rescans
-                        if not self._passes_watch_filter(fpath):
-                            continue
-                        last_scan = self._rescanned.get(fpath, 0.0)
-                        if now - last_scan >= interval_secs:
-                            self._rescanned[fpath] = now
-                            self.root.after(0, lambda p=fpath: self._on_rescan_file(p))
-                            files_found += 1
-                            # Throttle: wait between each file to stay slow/accurate
-                            time.sleep(interval_secs)
-                            now = time.time()
+                for fpath_obj in scan_dir.rglob("*"):
                     if self._stop_event.is_set():
                         break
+                    if not fpath_obj.is_file():
+                        continue
+                    fpath = str(fpath_obj)
+                    # Respect the watch filter during periodic rescans
+                    if not self._passes_watch_filter(fpath):
+                        continue
+                    last_scan = self._rescanned.get(fpath, 0.0)
+                    if now - last_scan >= interval_secs:
+                        self._rescanned[fpath] = now
+                        self.root.after(0, lambda p=fpath: self._on_rescan_file(p))
+                        files_found += 1
+                        # Throttle: wait between each file to stay slow/accurate
+                        time.sleep(interval_secs)
+                        now = time.time()
                 if self._stop_event.is_set():
                     break
 
