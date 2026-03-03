@@ -40,6 +40,10 @@ class AIRenameSortApp:
         self.duplicate_detector = DuplicateDetector()
         self.watcher: FileWatcher | None = None
 
+        # Stores duplicate candidates for files tagged "Duplicate" in the queue
+        # filepath -> [(candidate_path, match_type, ai_confidence, ai_reason), ...]
+        self._duplicate_info: dict[str, list[tuple]] = {}
+
         # Stop event – set while watching is paused/stopped, cleared on start
         self._stop_event = threading.Event()
         self._stop_event.set()  # initially stopped
@@ -197,6 +201,7 @@ class AIRenameSortApp:
         self.queue_tree.tag_configure("error", foreground="red")
         self.queue_tree.tag_configure("processing", foreground="gray")
         self.queue_tree.tag_configure("rescan", foreground="#0077CC")
+        self.queue_tree.tag_configure("duplicate", foreground="#CC7700")
 
         vsb = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.queue_tree.yview)
         self.queue_tree.configure(yscrollcommand=vsb.set)
@@ -209,7 +214,8 @@ class AIRenameSortApp:
         ttk.Button(act, text="Apply Selected", command=self._apply_selected).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(act, text="Edit Selected", command=self._edit_selected).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(act, text="Process Selected", command=self._process_selected).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(act, text="Skip Selected", command=self._skip_selected).pack(side=tk.LEFT)
+        ttk.Button(act, text="Skip Selected", command=self._skip_selected).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(act, text="Resolve Duplicate", command=self._resolve_duplicate_selected).pack(side=tk.LEFT)
 
     # ---- Settings tab ------------------------------------------------
 
@@ -1225,12 +1231,18 @@ class AIRenameSortApp:
         model: str,
         candidates: list[tuple[str, str]],
     ) -> str | None:
-        """Process duplicate candidates and show a dialog if needed.
+        """Tag duplicate files and skip them for later manual review.
 
-        Returns the user's chosen action: ``"keep_both"``, ``"replace"``,
-        ``"skip"``, or ``None`` (dialog dismissed).
+        Instead of blocking the processing thread with a modal dialog, this
+        method records each confirmed duplicate candidate, marks the file as
+        "Duplicate" in the queue (orange), and returns ``"skip"`` so that
+        processing continues with the next file.  The user can later select
+        the item and click **Resolve Duplicate** to choose what to do.
+
+        Returns ``"skip"`` when at least one confirmed candidate is found,
+        ``None`` otherwise.
         """
-        import threading as _threading
+        confirmed: list[tuple] = []
 
         for candidate_path, match_type in candidates:
             ai_confidence: float | None = None
@@ -1261,42 +1273,85 @@ class AIRenameSortApp:
                 f"Duplicate candidate: {Path(candidate_path).name} "
                 f"({match_type}, confidence={ai_confidence})"
             )
+            confirmed.append((candidate_path, match_type, ai_confidence, ai_reason))
 
-            # Show the side-by-side dialog on the main thread and wait
-            result_holder: list[str | None] = [None]
-            event = _threading.Event()
-
-            def _show_dialog(
-                _fp=filepath, _cp=candidate_path, _mt=match_type,
-                _conf=ai_confidence, _reason=ai_reason,
-            ):
-                dlg = DuplicateDialog(
-                    self.root, _fp, _cp,
-                    match_type=_mt,
-                    ai_confidence=_conf,
-                    ai_reason=_reason,
-                )
-                self.root.wait_window(dlg)
-                result_holder[0] = dlg.result
-                event.set()
-
-            self.root.after(0, _show_dialog)
-            event.wait()  # block background thread until dialog closes
-
-            action = result_holder[0]
-            if action == "replace":
-                try:
-                    Path(candidate_path).unlink()
-                    self._log_thread(f"Deleted existing: {candidate_path}")
-                except OSError as exc:
-                    self._log_thread(f"Could not delete existing file: {exc}")
-                return "replace"
-            elif action == "skip":
-                return "skip"
-            else:
-                return "keep_both"
+        if confirmed:
+            # Store info for later resolution and tag the item in the queue
+            self._duplicate_info[filepath] = confirmed
+            self.root.after(
+                0,
+                lambda p=filepath: self._upsert_queue(p, "", "", "Duplicate"),
+            )
+            return "skip"
 
         return None  # no confirmed duplicates
+
+    def _resolve_duplicate_selected(self):
+        """Open the DuplicateDialog for the selected 'Duplicate' queue item.
+
+        The user can choose Keep Both, Replace Existing, or Skip New File.
+        The decision is applied immediately and the item is re-queued for AI
+        processing (Keep Both / Replace) or permanently skipped (Skip).
+        """
+        sel = self.queue_tree.selection()
+        if not sel:
+            messagebox.showinfo("No Selection", "Please select a Duplicate item in the queue.")
+            return
+        iid = sel[0]
+        filepath = self._filepath_for_item(iid)
+        if not filepath:
+            return
+
+        values = self.queue_tree.item(iid)["values"]
+        if str(values[3]).lower() != "duplicate":
+            messagebox.showinfo(
+                "Not a Duplicate",
+                "The selected item is not tagged as a duplicate.\n"
+                "Only items with status 'Duplicate' can be resolved here.",
+            )
+            return
+
+        candidates = self._duplicate_info.get(filepath, [])
+        if not candidates:
+            # No stored info – just re-queue for normal processing
+            self._duplicate_info.pop(filepath, None)
+            self._proc_queue.put(filepath)
+            self._upsert_queue(filepath, "", "", "Queued")
+            return
+
+        # Show the dialog for the first confirmed candidate
+        candidate_path, match_type, ai_confidence, ai_reason = candidates[0]
+
+        dlg = DuplicateDialog(
+            self.root, filepath, candidate_path,
+            match_type=match_type,
+            ai_confidence=ai_confidence,
+            ai_reason=ai_reason,
+        )
+        self.root.wait_window(dlg)
+        action = dlg.result
+
+        # Clean up stored duplicate info regardless of action
+        self._duplicate_info.pop(filepath, None)
+
+        if action == "replace":
+            try:
+                Path(candidate_path).unlink()
+                self._log(f"Deleted existing duplicate: {candidate_path}")
+            except OSError as exc:
+                self._log(f"Could not delete existing file: {exc}")
+            # Re-queue for AI analysis now that the conflict is gone
+            self._proc_queue.put(filepath)
+            self._upsert_queue(filepath, "", "", "Queued")
+
+        elif action == "keep_both":
+            # Re-queue; the filename conflict will be resolved by auto-increment
+            self._proc_queue.put(filepath)
+            self._upsert_queue(filepath, "", "", "Queued")
+
+        else:
+            # "skip" or dialog dismissed – mark permanently skipped
+            self._upsert_queue(filepath, "", "", "Skipped")
 
     # ------------------------------------------------------------------
     # Periodic rescan
